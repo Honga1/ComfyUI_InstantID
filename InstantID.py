@@ -28,6 +28,11 @@ folder_paths.folder_names_and_paths["instantid"] = (current_paths, folder_paths.
 
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
+# Global caches for performance optimization
+_instantid_model_cache = {}
+_faceanalysis_cache = {}
+_face_embeddings_cache = {}
+
 def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
     stickwidth = 4
     limbSeq = np.array([[0, 2], [1, 2], [3, 2], [4, 2]])
@@ -145,6 +150,12 @@ class InstantIDModelLoader:
     CATEGORY = "InstantID"
 
     def load_model(self, instantid_file):
+        global _instantid_model_cache
+
+        # Check cache first
+        if instantid_file in _instantid_model_cache:
+            return (_instantid_model_cache[instantid_file],)
+
         ckpt_path = folder_paths.get_full_path("instantid", instantid_file)
 
         model = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
@@ -166,9 +177,24 @@ class InstantIDModelLoader:
             clip_extra_context_tokens=16,
         )
 
+        # Cache the loaded model
+        _instantid_model_cache[instantid_file] = model
+
         return (model,)
 
 def extractFeatures(insightface, image, extract_kps=False):
+    global _face_embeddings_cache
+
+    # Create cache key based on tensor properties and extraction mode
+    # Using data_ptr as a fast hash for the same tensor object
+    try:
+        cache_key = (image.data_ptr(), image.shape, image.device.type, extract_kps)
+        if cache_key in _face_embeddings_cache:
+            return _face_embeddings_cache[cache_key]
+    except:
+        # If data_ptr fails, skip caching for this call
+        cache_key = None
+
     face_img = tensor_to_image(image)
     out = []
 
@@ -198,6 +224,10 @@ def extractFeatures(insightface, image, extract_kps=False):
     else:
         out = None
 
+    # Cache the result if we have a valid cache key
+    if cache_key is not None and out is not None:
+        _face_embeddings_cache[cache_key] = out
+
     return out
 
 class InstantIDFaceAnalysis:
@@ -214,8 +244,18 @@ class InstantIDFaceAnalysis:
     CATEGORY = "InstantID"
 
     def load_insight_face(self, provider):
+        global _faceanalysis_cache
+
+        # Check cache first
+        cache_key = f"antelopev2_{provider}"
+        if cache_key in _faceanalysis_cache:
+            return (_faceanalysis_cache[cache_key],)
+
         model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # alternative to buffalo_l
         model.prepare(ctx_id=0, det_size=(640, 640))
+
+        # Cache the face analysis model
+        _faceanalysis_cache[cache_key] = model
 
         return (model,)
 
