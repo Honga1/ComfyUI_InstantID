@@ -358,19 +358,30 @@ class ApplyInstantID:
 
         # 1: patch the attention
         self.instantid = instantid
-        self.instantid.to(self.device, dtype=self.dtype)
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+        # Only move model to device if not already there (cache device state)
+        if not hasattr(self, '_instantid_device') or self._instantid_device != (self.device, self.dtype):
+            self.instantid.to(self.device, dtype=self.dtype)
+            self._instantid_device = (self.device, self.dtype)
 
-        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
-        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+        # Move embeddings to device only if needed
+        if clip_embed.device != self.device or clip_embed.dtype != self.dtype:
+            clip_embed = clip_embed.to(self.device, dtype=self.dtype)
+        if clip_embed_zeroed.device != self.device or clip_embed_zeroed.dtype != self.dtype:
+            clip_embed_zeroed = clip_embed_zeroed.to(self.device, dtype=self.dtype)
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed, clip_embed_zeroed)
+
+        # REMOVED: Redundant transfers - get_image_embeds already returns tensors on GPU
+        # image_prompt_embeds and uncond_image_prompt_embeds are already on self.device
 
         work_model = model.clone()
 
         sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
         sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
-        if mask is not None:
+        # Only move mask to device if needed
+        if mask is not None and mask.device != self.device:
             mask = mask.to(self.device)
 
         patch_kwargs = {
@@ -424,7 +435,12 @@ class ApplyInstantID:
 
                 d['control'] = c_net
                 d['control_apply_to_uncond'] = False
-                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device(), dtype=c_net.cond_hint_original.dtype) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device(), dtype=c_net.cond_hint_original.dtype)
+                # Keep embeddings on GPU, only convert dtype if needed (avoid GPU->CPU->GPU roundtrip)
+                embeds = image_prompt_embeds if is_cond else uncond_image_prompt_embeds
+                if embeds.dtype != c_net.cond_hint_original.dtype:
+                    d['cross_attn_controlnet'] = embeds.to(dtype=c_net.cond_hint_original.dtype)
+                else:
+                    d['cross_attn_controlnet'] = embeds
 
                 if mask is not None and is_cond:
                     d['mask'] = mask
@@ -507,12 +523,22 @@ class InstantIDAttentionPatch:
 
         # 1: patch the attention
         self.instantid = instantid
-        self.instantid.to(self.device, dtype=self.dtype)
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+        # Only move model to device if not already there (cache device state)
+        if not hasattr(self, '_instantid_device') or self._instantid_device != (self.device, self.dtype):
+            self.instantid.to(self.device, dtype=self.dtype)
+            self._instantid_device = (self.device, self.dtype)
 
-        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
-        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+        # Move embeddings to device only if needed
+        if clip_embed.device != self.device or clip_embed.dtype != self.dtype:
+            clip_embed = clip_embed.to(self.device, dtype=self.dtype)
+        if clip_embed_zeroed.device != self.device or clip_embed_zeroed.dtype != self.dtype:
+            clip_embed_zeroed = clip_embed_zeroed.to(self.device, dtype=self.dtype)
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed, clip_embed_zeroed)
+
+        # REMOVED: Redundant transfers - get_image_embeds already returns tensors on GPU
+        # image_prompt_embeds and uncond_image_prompt_embeds are already on self.device
 
         if weight == 0:
             return (model, { "cond": image_prompt_embeds, "uncond": uncond_image_prompt_embeds } )
@@ -522,7 +548,8 @@ class InstantIDAttentionPatch:
         sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
         sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
-        if mask is not None:
+        # Only move mask to device if needed
+        if mask is not None and mask.device != self.device:
             mask = mask.to(self.device)
 
         patch_kwargs = {
@@ -585,7 +612,8 @@ class ApplyInstantIDControlNet:
         if strength == 0:
             return (positive, negative)
 
-        if mask is not None:
+        # Only move mask to device if needed
+        if mask is not None and mask.device != self.device:
             mask = mask.to(self.device)
 
         if mask is not None and len(mask.shape) < 3:
@@ -614,7 +642,8 @@ class ApplyInstantIDControlNet:
 
                 d['control'] = c_net
                 d['control_apply_to_uncond'] = False
-                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device()) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device())
+                # Keep embeddings on GPU instead of moving to intermediate device
+                d['cross_attn_controlnet'] = image_prompt_embeds if is_cond else uncond_image_prompt_embeds
 
                 if mask is not None and is_cond:
                     d['mask'] = mask
