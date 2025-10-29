@@ -196,25 +196,45 @@ def extractFeatures(insightface, image, extract_kps=False):
         cache_key = None
 
     face_img = tensor_to_image(image)
-    out = []
+    num_images = face_img.shape[0]
 
-    insightface.det_model.input_size = (640,640) # reset the detection size
+    # Pre-allocate results list with None placeholders
+    out = [None] * num_images
+    remaining_indices = list(range(num_images))
 
-    for i in range(face_img.shape[0]):
-        for size in [(size, size) for size in range(640, 128, -64)]:
-            insightface.det_model.input_size = size # TODO: hacky but seems to be working
+    # Optimized multi-pass detection: try larger sizes first, only retry failures
+    detection_sizes = [640, 512, 384, 256, 192, 128]
+
+    for size in detection_sizes:
+        if not remaining_indices:
+            break  # All faces detected
+
+        insightface.det_model.input_size = (size, size)
+
+        # Try to detect faces for all remaining images at current size
+        newly_detected = []
+        for i in remaining_indices:
             face = insightface.get(face_img[i])
             if face:
+                # Get largest face by bbox area
                 face = sorted(face, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
 
                 if extract_kps:
-                    out.append(draw_kps(face_img[i], face['kps']))
+                    out[i] = draw_kps(face_img[i], face['kps'])
                 else:
-                    out.append(torch.from_numpy(face['embedding']).unsqueeze(0))
+                    out[i] = torch.from_numpy(face['embedding']).unsqueeze(0)
 
-                if 640 not in size:
-                    print(f"\033[33mINFO: InsightFace detection resolution lowered to {size}.\033[0m")
-                break
+                newly_detected.append(i)
+
+                if size != 640:
+                    print(f"\033[33mINFO: InsightFace detection for image {i} lowered to {size}x{size}.\033[0m")
+
+        # Remove successfully detected images from remaining list
+        for i in newly_detected:
+            remaining_indices.remove(i)
+
+    # Filter out None values (undetected faces)
+    out = [x for x in out if x is not None]
 
     if out:
         if extract_kps:
