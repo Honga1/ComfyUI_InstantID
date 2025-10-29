@@ -6,6 +6,9 @@ import numpy as np
 import math
 import cv2
 import PIL.Image
+import hashlib
+import threading
+from collections import OrderedDict
 from .resampler import Resampler
 from .CrossAttentionPatch import Attn2Replace, instantid_attention
 from .utils import tensor_to_image
@@ -18,6 +21,112 @@ except ImportError:
     import torchvision.transforms as T
 
 import torch.nn.functional as F
+
+# ============================================================================
+# Run Caching System
+# ============================================================================
+
+class RunCache:
+    """
+    Thread-safe LRU cache for expensive operations like face detection and embedding extraction.
+    Caches results based on input tensor hashes to avoid re-computation when inputs don't change.
+    """
+    def __init__(self, max_size=50):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get_tensor_hash(self, tensor):
+        """Generate a hash key from a tensor."""
+        if tensor is None:
+            return "none"
+
+        # Convert tensor to bytes and hash it
+        # Use a subset of data for large tensors to balance speed and uniqueness
+        tensor_flat = tensor.detach().cpu().flatten()
+        if tensor_flat.numel() > 10000:
+            # For large tensors, sample evenly across the data
+            indices = torch.linspace(0, tensor_flat.numel()-1, 10000, dtype=torch.long)
+            tensor_flat = tensor_flat[indices]
+
+        tensor_bytes = tensor_flat.numpy().tobytes()
+        return hashlib.sha256(tensor_bytes).hexdigest()
+
+    def get_key(self, *args, **kwargs):
+        """Generate a cache key from arguments."""
+        key_parts = []
+
+        # Hash tensor arguments
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                key_parts.append(self.get_tensor_hash(arg))
+            elif isinstance(arg, np.ndarray):
+                key_parts.append(hashlib.sha256(arg.tobytes()).hexdigest()[:16])
+            else:
+                key_parts.append(str(arg))
+
+        # Hash keyword arguments
+        for k, v in sorted(kwargs.items()):
+            if isinstance(v, torch.Tensor):
+                key_parts.append(f"{k}:{self.get_tensor_hash(v)}")
+            elif isinstance(v, np.ndarray):
+                key_parts.append(f"{k}:{hashlib.sha256(v.tobytes()).hexdigest()[:16]}")
+            else:
+                key_parts.append(f"{k}:{v}")
+
+        return "_".join(key_parts)
+
+    def get(self, key):
+        """Retrieve a cached value."""
+        with self.lock:
+            if key in self.cache:
+                # Move to end (most recently used)
+                self.cache.move_to_end(key)
+                self.hits += 1
+                return self.cache[key]
+            self.misses += 1
+            return None
+
+    def put(self, key, value):
+        """Store a value in the cache."""
+        with self.lock:
+            if key in self.cache:
+                # Update existing entry
+                self.cache.move_to_end(key)
+            else:
+                # Add new entry
+                self.cache[key] = value
+
+                # Evict oldest entry if cache is full
+                if len(self.cache) > self.max_size:
+                    self.cache.popitem(last=False)
+
+    def clear(self):
+        """Clear the cache."""
+        with self.lock:
+            self.cache.clear()
+            self.hits = 0
+            self.misses = 0
+
+    def get_stats(self):
+        """Get cache statistics."""
+        with self.lock:
+            total = self.hits + self.misses
+            hit_rate = (self.hits / total * 100) if total > 0 else 0
+            return {
+                "hits": self.hits,
+                "misses": self.misses,
+                "size": len(self.cache),
+                "hit_rate": f"{hit_rate:.1f}%"
+            }
+
+# Global cache instances
+_face_features_cache = RunCache(max_size=50)
+_image_embeds_cache = RunCache(max_size=50)
+
+# ============================================================================
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "instantid")
 if "instantid" not in folder_paths.folder_names_and_paths:
@@ -85,10 +194,27 @@ class InstantID(torch.nn.Module):
 
     @torch.inference_mode()
     def get_image_embeds(self, clip_embed, clip_embed_zeroed):
+        """
+        Project clip embeddings through the resampler model.
+        Results are cached based on input embeddings.
+        """
+        # Generate cache key from both input embeddings
+        cache_key = _image_embeds_cache.get_key(clip_embed, clip_embed_zeroed)
+
+        # Check cache first
+        cached_result = _image_embeds_cache.get(cache_key)
+        if cached_result is not None:
+            # Return clones to avoid modification of cached data
+            return cached_result[0].clone(), cached_result[1].clone()
+
+        # Cache miss - compute the embeddings
         #image_prompt_embeds = clip_embed.clone().detach()
         image_prompt_embeds = self.image_proj_model(clip_embed)
         #uncond_image_prompt_embeds = clip_embed_zeroed.clone().detach()
         uncond_image_prompt_embeds = self.image_proj_model(clip_embed_zeroed)
+
+        # Store result in cache (clone to preserve original)
+        _image_embeds_cache.put(cache_key, (image_prompt_embeds.clone(), uncond_image_prompt_embeds.clone()))
 
         return image_prompt_embeds, uncond_image_prompt_embeds
 
@@ -169,6 +295,22 @@ class InstantIDModelLoader:
         return (model,)
 
 def extractFeatures(insightface, image, extract_kps=False):
+    """
+    Extract face features (embeddings or keypoints) from an image using InsightFace.
+    Results are cached based on image content and extraction type.
+    """
+    # Generate cache key from image tensor and extract_kps flag
+    cache_key = _face_features_cache.get_key(image, extract_kps=extract_kps)
+
+    # Check cache first
+    cached_result = _face_features_cache.get(cache_key)
+    if cached_result is not None:
+        # Deep copy tensors to avoid modification of cached data
+        if isinstance(cached_result, torch.Tensor):
+            return cached_result.clone()
+        return cached_result
+
+    # Cache miss - compute the features
     face_img = tensor_to_image(image)
     out = []
 
@@ -197,6 +339,9 @@ def extractFeatures(insightface, image, extract_kps=False):
             out = torch.stack(out, dim=0)
     else:
         out = None
+
+    # Store result in cache
+    _face_features_cache.put(cache_key, out.clone() if isinstance(out, torch.Tensor) else out)
 
     return out
 
@@ -587,6 +732,55 @@ class ApplyInstantIDControlNet:
 
         return(cond_uncond[0], cond_uncond[1])
 
+class InstantIDCacheManager:
+    """
+    Utility node for managing InstantID run caches.
+    Displays cache statistics and optionally clears caches.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clear_cache": (["false", "true"], {"default": "false"}),
+            },
+            "optional": {
+                "passthrough": ("*",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "*",)
+    RETURN_NAMES = ("cache_stats", "passthrough",)
+    FUNCTION = "manage_cache"
+    CATEGORY = "InstantID"
+    OUTPUT_NODE = True
+
+    def manage_cache(self, clear_cache="false", passthrough=None):
+        if clear_cache == "true":
+            _face_features_cache.clear()
+            _image_embeds_cache.clear()
+            stats_msg = "Cache cleared!\n"
+        else:
+            stats_msg = ""
+
+        # Get statistics from both caches
+        face_stats = _face_features_cache.get_stats()
+        embeds_stats = _image_embeds_cache.get_stats()
+
+        # Format statistics message
+        stats_msg += f"Face Features Cache:\n"
+        stats_msg += f"  Hits: {face_stats['hits']}, Misses: {face_stats['misses']}\n"
+        stats_msg += f"  Size: {face_stats['size']}/50\n"
+        stats_msg += f"  Hit Rate: {face_stats['hit_rate']}\n\n"
+
+        stats_msg += f"Image Embeds Cache:\n"
+        stats_msg += f"  Hits: {embeds_stats['hits']}, Misses: {embeds_stats['misses']}\n"
+        stats_msg += f"  Size: {embeds_stats['size']}/50\n"
+        stats_msg += f"  Hit Rate: {embeds_stats['hit_rate']}"
+
+        print(f"\033[36m{stats_msg}\033[0m")
+
+        return {"ui": {"text": [stats_msg]}, "result": (stats_msg, passthrough)}
+
 
 NODE_CLASS_MAPPINGS = {
     "InstantIDModelLoader": InstantIDModelLoader,
@@ -597,6 +791,8 @@ NODE_CLASS_MAPPINGS = {
 
     "InstantIDAttentionPatch": InstantIDAttentionPatch,
     "ApplyInstantIDControlNet": ApplyInstantIDControlNet,
+
+    "InstantIDCacheManager": InstantIDCacheManager,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -608,4 +804,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
     "InstantIDAttentionPatch": "InstantID Patch Attention",
     "ApplyInstantIDControlNet": "InstantID Apply ControlNet",
+
+    "InstantIDCacheManager": "InstantID Cache Manager",
 }
