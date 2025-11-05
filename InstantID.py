@@ -28,6 +28,11 @@ folder_paths.folder_names_and_paths["instantid"] = (current_paths, folder_paths.
 
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
+# Global caches for performance optimization
+_instantid_model_cache = {}
+_faceanalysis_cache = {}
+_face_embeddings_cache = {}
+
 def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
     stickwidth = 4
     limbSeq = np.array([[0, 2], [1, 2], [3, 2], [4, 2]])
@@ -145,6 +150,12 @@ class InstantIDModelLoader:
     CATEGORY = "InstantID"
 
     def load_model(self, instantid_file):
+        global _instantid_model_cache
+
+        # Check cache first
+        if instantid_file in _instantid_model_cache:
+            return (_instantid_model_cache[instantid_file],)
+
         ckpt_path = folder_paths.get_full_path("instantid", instantid_file)
 
         model = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
@@ -166,29 +177,64 @@ class InstantIDModelLoader:
             clip_extra_context_tokens=16,
         )
 
+        # Cache the loaded model
+        _instantid_model_cache[instantid_file] = model
+
         return (model,)
 
 def extractFeatures(insightface, image, extract_kps=False):
+    global _face_embeddings_cache
+
+    # Create cache key based on tensor properties and extraction mode
+    # Using data_ptr as a fast hash for the same tensor object
+    try:
+        cache_key = (image.data_ptr(), image.shape, image.device.type, extract_kps)
+        if cache_key in _face_embeddings_cache:
+            return _face_embeddings_cache[cache_key]
+    except:
+        # If data_ptr fails, skip caching for this call
+        cache_key = None
+
     face_img = tensor_to_image(image)
-    out = []
+    num_images = face_img.shape[0]
 
-    insightface.det_model.input_size = (640,640) # reset the detection size
+    # Pre-allocate results list with None placeholders
+    out = [None] * num_images
+    remaining_indices = list(range(num_images))
 
-    for i in range(face_img.shape[0]):
-        for size in [(size, size) for size in range(640, 128, -64)]:
-            insightface.det_model.input_size = size # TODO: hacky but seems to be working
+    # Optimized multi-pass detection: try larger sizes first, only retry failures
+    detection_sizes = [640, 512, 384, 256, 192, 128]
+
+    for size in detection_sizes:
+        if not remaining_indices:
+            break  # All faces detected
+
+        insightface.det_model.input_size = (size, size)
+
+        # Try to detect faces for all remaining images at current size
+        newly_detected = []
+        for i in remaining_indices:
             face = insightface.get(face_img[i])
             if face:
+                # Get largest face by bbox area
                 face = sorted(face, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1]
 
                 if extract_kps:
-                    out.append(draw_kps(face_img[i], face['kps']))
+                    out[i] = draw_kps(face_img[i], face['kps'])
                 else:
-                    out.append(torch.from_numpy(face['embedding']).unsqueeze(0))
+                    out[i] = torch.from_numpy(face['embedding']).unsqueeze(0)
 
-                if 640 not in size:
-                    print(f"\033[33mINFO: InsightFace detection resolution lowered to {size}.\033[0m")
-                break
+                newly_detected.append(i)
+
+                if size != 640:
+                    print(f"\033[33mINFO: InsightFace detection for image {i} lowered to {size}x{size}.\033[0m")
+
+        # Remove successfully detected images from remaining list
+        for i in newly_detected:
+            remaining_indices.remove(i)
+
+    # Filter out None values (undetected faces)
+    out = [x for x in out if x is not None]
 
     if out:
         if extract_kps:
@@ -197,6 +243,10 @@ def extractFeatures(insightface, image, extract_kps=False):
             out = torch.stack(out, dim=0)
     else:
         out = None
+
+    # Cache the result if we have a valid cache key
+    if cache_key is not None and out is not None:
+        _face_embeddings_cache[cache_key] = out
 
     return out
 
@@ -214,8 +264,18 @@ class InstantIDFaceAnalysis:
     CATEGORY = "InstantID"
 
     def load_insight_face(self, provider):
+        global _faceanalysis_cache
+
+        # Check cache first
+        cache_key = f"antelopev2_{provider}"
+        if cache_key in _faceanalysis_cache:
+            return (_faceanalysis_cache[cache_key],)
+
         model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # alternative to buffalo_l
         model.prepare(ctx_id=0, det_size=(640, 640))
+
+        # Cache the face analysis model
+        _faceanalysis_cache[cache_key] = model
 
         return (model,)
 
@@ -318,19 +378,30 @@ class ApplyInstantID:
 
         # 1: patch the attention
         self.instantid = instantid
-        self.instantid.to(self.device, dtype=self.dtype)
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+        # Only move model to device if not already there (cache device state)
+        if not hasattr(self, '_instantid_device') or self._instantid_device != (self.device, self.dtype):
+            self.instantid.to(self.device, dtype=self.dtype)
+            self._instantid_device = (self.device, self.dtype)
 
-        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
-        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+        # Move embeddings to device only if needed
+        if clip_embed.device != self.device or clip_embed.dtype != self.dtype:
+            clip_embed = clip_embed.to(self.device, dtype=self.dtype)
+        if clip_embed_zeroed.device != self.device or clip_embed_zeroed.dtype != self.dtype:
+            clip_embed_zeroed = clip_embed_zeroed.to(self.device, dtype=self.dtype)
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed, clip_embed_zeroed)
+
+        # REMOVED: Redundant transfers - get_image_embeds already returns tensors on GPU
+        # image_prompt_embeds and uncond_image_prompt_embeds are already on self.device
 
         work_model = model.clone()
 
         sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
         sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
-        if mask is not None:
+        # Only move mask to device if needed
+        if mask is not None and mask.device != self.device:
             mask = mask.to(self.device)
 
         patch_kwargs = {
@@ -384,7 +455,12 @@ class ApplyInstantID:
 
                 d['control'] = c_net
                 d['control_apply_to_uncond'] = False
-                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device(), dtype=c_net.cond_hint_original.dtype) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device(), dtype=c_net.cond_hint_original.dtype)
+                # Keep embeddings on GPU, only convert dtype if needed (avoid GPU->CPU->GPU roundtrip)
+                embeds = image_prompt_embeds if is_cond else uncond_image_prompt_embeds
+                if embeds.dtype != c_net.cond_hint_original.dtype:
+                    d['cross_attn_controlnet'] = embeds.to(dtype=c_net.cond_hint_original.dtype)
+                else:
+                    d['cross_attn_controlnet'] = embeds
 
                 if mask is not None and is_cond:
                     d['mask'] = mask
@@ -467,12 +543,22 @@ class InstantIDAttentionPatch:
 
         # 1: patch the attention
         self.instantid = instantid
-        self.instantid.to(self.device, dtype=self.dtype)
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+        # Only move model to device if not already there (cache device state)
+        if not hasattr(self, '_instantid_device') or self._instantid_device != (self.device, self.dtype):
+            self.instantid.to(self.device, dtype=self.dtype)
+            self._instantid_device = (self.device, self.dtype)
 
-        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
-        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+        # Move embeddings to device only if needed
+        if clip_embed.device != self.device or clip_embed.dtype != self.dtype:
+            clip_embed = clip_embed.to(self.device, dtype=self.dtype)
+        if clip_embed_zeroed.device != self.device or clip_embed_zeroed.dtype != self.dtype:
+            clip_embed_zeroed = clip_embed_zeroed.to(self.device, dtype=self.dtype)
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed, clip_embed_zeroed)
+
+        # REMOVED: Redundant transfers - get_image_embeds already returns tensors on GPU
+        # image_prompt_embeds and uncond_image_prompt_embeds are already on self.device
 
         if weight == 0:
             return (model, { "cond": image_prompt_embeds, "uncond": uncond_image_prompt_embeds } )
@@ -482,7 +568,8 @@ class InstantIDAttentionPatch:
         sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
         sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
 
-        if mask is not None:
+        # Only move mask to device if needed
+        if mask is not None and mask.device != self.device:
             mask = mask.to(self.device)
 
         patch_kwargs = {
@@ -545,7 +632,8 @@ class ApplyInstantIDControlNet:
         if strength == 0:
             return (positive, negative)
 
-        if mask is not None:
+        # Only move mask to device if needed
+        if mask is not None and mask.device != self.device:
             mask = mask.to(self.device)
 
         if mask is not None and len(mask.shape) < 3:
@@ -574,7 +662,8 @@ class ApplyInstantIDControlNet:
 
                 d['control'] = c_net
                 d['control_apply_to_uncond'] = False
-                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device()) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device())
+                # Keep embeddings on GPU instead of moving to intermediate device
+                d['cross_attn_controlnet'] = image_prompt_embeds if is_cond else uncond_image_prompt_embeds
 
                 if mask is not None and is_cond:
                     d['mask'] = mask

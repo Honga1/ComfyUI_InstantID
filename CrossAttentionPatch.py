@@ -119,10 +119,11 @@ def instantid_attention(out, q, k, v, extra_options, module_key='', ipadapter=No
         elif weight == 0:
             return 0
 
-        k_cond = ipadapter.ip_layers.to_kvs[k_key](cond).repeat(batch_prompt, 1, 1)
-        k_uncond = ipadapter.ip_layers.to_kvs[k_key](uncond).repeat(batch_prompt, 1, 1)
-        v_cond = ipadapter.ip_layers.to_kvs[v_key](cond).repeat(batch_prompt, 1, 1)
-        v_uncond = ipadapter.ip_layers.to_kvs[v_key](uncond).repeat(batch_prompt, 1, 1)
+        # Use expand instead of repeat to avoid memory allocation, then cat will copy
+        k_cond = ipadapter.ip_layers.to_kvs[k_key](cond).expand(batch_prompt, -1, -1)
+        k_uncond = ipadapter.ip_layers.to_kvs[k_key](uncond).expand(batch_prompt, -1, -1)
+        v_cond = ipadapter.ip_layers.to_kvs[v_key](cond).expand(batch_prompt, -1, -1)
+        v_uncond = ipadapter.ip_layers.to_kvs[v_key](uncond).expand(batch_prompt, -1, -1)
 
     ip_k = torch.cat([(k_cond, k_uncond)[i] for i in cond_or_uncond], dim=0)
     ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0)
@@ -130,7 +131,7 @@ def instantid_attention(out, q, k, v, extra_options, module_key='', ipadapter=No
     if embeds_scaling == 'K+mean(V) w/ C penalty':
         scaling = float(ip_k.shape[2]) / 1280.0
         weight = weight * scaling
-        ip_k = ip_k * weight
+        ip_k.mul_(weight)  # In-place multiplication
         ip_v_mean = torch.mean(ip_v, dim=1, keepdim=True)
         ip_v = (ip_v - ip_v_mean) + ip_v_mean * weight
         out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
@@ -138,17 +139,16 @@ def instantid_attention(out, q, k, v, extra_options, module_key='', ipadapter=No
     elif embeds_scaling == 'K+V w/ C penalty':
         scaling = float(ip_k.shape[2]) / 1280.0
         weight = weight * scaling
-        ip_k = ip_k * weight
-        ip_v = ip_v * weight
+        ip_k.mul_(weight)  # In-place multiplication
+        ip_v.mul_(weight)  # In-place multiplication
         out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
     elif embeds_scaling == 'K+V':
-        ip_k = ip_k * weight
-        ip_v = ip_v * weight
+        ip_k.mul_(weight)  # In-place multiplication
+        ip_v.mul_(weight)  # In-place multiplication
         out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
     else:
-        #ip_v = ip_v * weight
         out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
-        out_ip = out_ip * weight # I'm doing this to get the same results as before
+        out_ip.mul_(weight)  # In-place multiplication
 
     if mask is not None:
         mask_h = oh / math.sqrt(oh * ow / seq_len)
@@ -183,7 +183,7 @@ def instantid_attention(out, q, k, v, extra_options, module_key='', ipadapter=No
             crop_start = (mask_len - seq_len) // 2
             mask = mask[:, crop_start:crop_start+seq_len, :]
 
-        out_ip = out_ip * mask
+        out_ip.mul_(mask)  # In-place multiplication with mask
 
     #out = out + out_ip
 
